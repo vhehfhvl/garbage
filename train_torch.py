@@ -1,11 +1,11 @@
-# -*- coding: utf-8 -*-
 import argparse
 import logging
-
+import timeit
 import gluonnlp as nlp
 import numpy as np
 import pandas as pd
 import torch
+import GPUtil
 from gluonnlp.data import SentencepieceTokenizer
 from kogpt2.pytorch_kogpt2 import get_pytorch_kogpt2_model
 from kogpt2.utils import get_tokenizer
@@ -14,6 +14,18 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.core.lightning import LightningModule
 from torch.utils.data import DataLoader, Dataset
 from transformers.optimization import AdamW, get_cosine_schedule_with_warmup
+from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
+#from log.chat.logging_chat import log_chat
+import time
+import logging
+import datetime
+from log.train.logging_train import log_train
+
+app = Flask(__name__)
+CORS(app, support_credentials=True)
+
+
 
 parser = argparse.ArgumentParser(description='Simsimi based on KoGPT-2')
 
@@ -37,8 +49,8 @@ parser.add_argument('--train',
                     default=False,
                     help='for training')
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+#logger = logging.getLogger()
+#logger.setLevel(logging.INFO)
 
 U_TKN = '<usr>'
 S_TKN = '<sys>'
@@ -46,6 +58,17 @@ BOS = '<s>'
 EOS = '</s>'
 MASK = '<unused0>'
 SENT = '<unused1>'
+
+
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+def log_chat(gpu_util, question, answer, generation_time):
+    GPUs = GPUtil.getGPUs()
+    for GPU in GPUs:
+        logging.basicConfig(filename='./log/chat/{}_chat.log'.format(datetime.datetime.now().strftime('%Y-%m-%d')), level=logging.DEBUG)
+        print('/KoGPT2chatbot/log/chat/{}_chat.log'.format(datetime.datetime.now().strftime('%Y-%m-%d')))
+        logging.debug('{}, {}, used_memory={}/{}, gpu_max_utilization={}, q={}, a={}, generation_time={}'.format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), GPU.name, GPU.memoryUsed, GPU.memoryTotal, gpu_util, question, answer, generation_time))
 
 
 class CharDataset(Dataset):
@@ -107,11 +130,11 @@ class CharDataset(Dataset):
             self.maskt,
         ] * q_len + a_toked[1:]
         if self.first:
-            logging.info("contexts : {}".format(q))
-            logging.info("toked ctx: {}".format(q_toked))
-            logging.info("response : {}".format(a))
-            logging.info("toked response : {}".format(a_toked))
-            logging.info('labels {}'.format(labels))
+            #logging.info("contexts : {}".format(q))
+            #logging.info("toked ctx: {}".format(q_toked))
+            #logging.info("response : {}".format(a))
+            #logging.info("toked response : {}".format(a_toked))
+            #logging.info('labels {}'.format(labels))
             self.first = False
         mask = [0] * q_len + [1] * a_len + [0] * (self.max_len - q_len - a_len)
         return (self.padder(self.vocab[q_toked + a_toked]), np.array(mask),
@@ -124,8 +147,10 @@ class KoGPT2Chat(LightningModule):
         self.hparams = hparams
         self.tok_path = get_tokenizer()
         self.neg = -1e18
-        self.kogpt2, self.vocab = get_pytorch_kogpt2_model()
+        self.kogpt2, self.vocab = get_pytorch_kogpt2_model("cuda")
         self.loss_function = torch.nn.CrossEntropyLoss(reduction='none')
+        self.max_gpu_load_train= 0
+        self.max_memory_used_train=0.0
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -138,7 +163,7 @@ class KoGPT2Chat(LightningModule):
 
         parser.add_argument('--batch-size',
                             type=int,
-                            default=96,
+                            default=16,
                             help='batch size for training (default: 96)')
         parser.add_argument('--lr',
                             type=float,
@@ -157,11 +182,24 @@ class KoGPT2Chat(LightningModule):
 
     def training_step(self, batch, batch_idx):
         token_ids, mask, label = batch
+        
+        if GPUtil.getGPUs()[0].load > self.max_gpu_load_train:
+            self.max_gpu_load_train = GPUtil.getGPUs()[0].load
+        if GPUtil.getGPUs()[0].memoryUsed > self.max_memory_used_train:
+            self.max_memory_used_train = GPUtil.getGPUs()[0].memoryUsed
+
         out = self(token_ids)
         mask_3d = mask.unsqueeze(dim=2).repeat_interleave(repeats=out.shape[2], dim=2)
         mask_out = torch.where(mask_3d == 1, out, self.neg * torch.ones_like(out))
         loss = self.loss_function(mask_out.transpose(2, 1), label)
         loss_avg = loss.sum() / mask.sum()
+        
+        if GPUtil.getGPUs()[0].memoryUsed > self.max_memory_used_train:
+            self.max_memory_used_train = GPUtil.getGPUs()[0].memoryUsed
+        if GPUtil.getGPUs()[0].load > self.max_gpu_load_train:
+            self.max_gpu_load_train = GPUtil.getGPUs()[0].load
+        
+        
         tensorboard_logs = {'train_loss': loss_avg}
         return {'loss': loss_avg, 'log': tensorboard_logs}
 
@@ -185,7 +223,7 @@ class KoGPT2Chat(LightningModule):
                         'monitor': 'loss', 'interval': 'step',
                         'frequency': 1}
         return [optimizer], [lr_scheduler]
-
+    
     def _collate_fn(self, batch):
         data = [item[0] for item in batch]
         mask = [item[1] for item in batch]
@@ -200,40 +238,62 @@ class KoGPT2Chat(LightningModule):
             shuffle=True, collate_fn=self._collate_fn)
         return train_dataloader
 
-    def chat(self, sent='0'):
+    def chat(self, sent='0', text=''):
+        start = timeit.default_timer()
         self.tok_path
         tok = SentencepieceTokenizer(self.tok_path, num_best=0, alpha=0)
         sent_tokens = tok(sent)
         with torch.no_grad():
+            max_gpu_load = 0
+            q = text
+            if q == 'quit':
+                return
+            q_tok = tok(q)
+            a = ''
+            a_tok = []
             while 1:
-                q = input('user > ').strip()
-                if q == 'quit':
-                    break
-                q_tok = tok(q)
-                a = ''
-                a_tok = []
-                while 1:
-                    input_ids = torch.LongTensor([
-                        self.vocab[U_TKN]] + self.vocab[q_tok] +
-                        self.vocab[EOS, SENT] + self.vocab[sent_tokens] +
-                        self.vocab[EOS, S_TKN] +
-                        self.vocab[a_tok]).unsqueeze(dim=0)
-                    pred = self(input_ids)
-                    gen = self.vocab.to_tokens(
-                        torch.argmax(
-                            pred,
-                            dim=-1).squeeze().numpy().tolist())[-1]
-                    if gen == EOS:
-                        break
-                    a += gen.replace('▁', ' ')
-                    a_tok = tok(a)
-                print("Simsimi > {}".format(a.strip()))
+                input_ids = torch.LongTensor([
+                    self.vocab[U_TKN]] + self.vocab[q_tok] +
+                    self.vocab[EOS, SENT] + self.vocab[sent_tokens] +
+                    self.vocab[EOS, S_TKN] +
+                    self.vocab[a_tok]).unsqueeze(dim=0).to("cuda")
+                pred = self(input_ids)
+                
+                if GPUtil.getGPUs()[0].load > max_gpu_load:
+                    max_gpu_load = GPUtil.getGPUs()[0].load
+                
+                gen = self.vocab.to_tokens(
+                    torch.argmax(
+                        pred,
+                        dim=-1).cpu().squeeze().numpy().tolist())[-1]
+                
+                if GPUtil.getGPUs()[0].load > max_gpu_load:
+                    max_gpu_load = GPUtil.getGPUs()[0].load
 
+                if gen == EOS:
+                    break
+                a += gen.replace('▁', ' ')
+                a_tok = tok(a)
+                app.logger.info(tok(a))
+            stop = timeit.default_timer()
+            #log_chat(max_gpu_load, sent, a.strip(), stop-start)
+            app.logger.info(a.strip())
+            return a.strip()
 
 parser = KoGPT2Chat.add_model_specific_args(parser)
 parser = Trainer.add_argparse_args(parser)
 args = parser.parse_args()
-logging.info(args)
+#logging.info(args)
+
+model = KoGPT2Chat.load_from_checkpoint(args.model_params)
+
+@app.route('/test', methods = ['POST'])
+@cross_origin(supports_credentials=True)
+def testSentence():
+  text = request.get_json(force=True)
+  app.logger.info(text['message'])
+  return jsonify(model.chat(text['message']))
+
 
 if __name__ == "__main__":
     if args.train:
@@ -245,14 +305,14 @@ if __name__ == "__main__":
             mode='min',
             prefix='model_'
         )
-        # python train_torch.py --train --gpus 1 --max_epochs 3
         model = KoGPT2Chat(args)
+        start = time.time()
         model.train()
         trainer = Trainer.from_argparse_args(
             args,
             checkpoint_callback=checkpoint_callback, gradient_clip_val=1.0)
         trainer.fit(model)
-        logging.info('best model path {}'.format(checkpoint_callback.best_model_path))
+        #log_train(model.max_memory_used_train, model.max_gpu_load_train, start, model.hparams.max_epochs, model.hparams.batch_size)
+
     if args.chat:
-        model = KoGPT2Chat.load_from_checkpoint(args.model_params)
-        model.chat()
+        app.run(host="0.0.0.0",port=5000)

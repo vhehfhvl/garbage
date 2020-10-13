@@ -2,15 +2,17 @@
 import argparse
 import logging
 import math
-
+import GPUtil
 import gluonnlp as nlp
 import mxnet as mx
 import pandas as pd
+import time
 from gluonnlp.data import SentencepieceTokenizer
 from kogpt2.mxnet_kogpt2 import get_mxnet_kogpt2_model
 from kogpt2.utils import get_tokenizer
 from mxnet import gluon, nd
 from mxnet.gluon import nn
+from log.train.logging_train import log_train
 
 parser = argparse.ArgumentParser(description='Simsimi based on KoGPT-2')
 
@@ -209,9 +211,14 @@ def train():
         for p in params:
             p.grad_req = 'add'
 
+    start_train = time.now()
+    max_gpu_load = 0
+    gpu_memory = 0
     for epoch_id in range(num_epochs):
         step_loss = 0
         for batch_id, (token_ids, mask, label) in enumerate(train_dataloader):
+            if GPUtil.getGPUs()[0].load > max_gpu_load:
+                max_gpu_load = GPUtil.getGPUs()[0].load
             if step_num < num_warmup_steps:
                 new_lr = lr * step_num / num_warmup_steps
             else:
@@ -244,6 +251,9 @@ def train():
                     # set grad to zero for gradient accumulation
                     all_model_params.zero_grad()
             step_loss += ls.asscalar()
+            if GPUtil.getGPUs()[0].load > max_gpu_load:
+                max_gpu_load = GPUtil.getGPUs()[0].load
+            gpu_memory = GPUtil.getGPUs()[0].memoryUsed
             if step_num % log_interval == 0 and step_num > 0:
                 print(
                     '[Epoch {} Batch {}/{}] loss={:.4f}, lr={:.10f}, train ppl={:.3f}'
@@ -251,6 +261,8 @@ def train():
                             step_loss / log_interval, trainer.learning_rate,
                             math.exp(step_loss / log_interval)))
                 step_loss = 0
+    print(1234)
+    log_train(gpu_memory, max_gpu_load, start_train, num_epochs, batch_size)
     logging.info('saving model file to {}'.format(opt.model_params))
     kogptqa.save_parameters(opt.model_params)
 
